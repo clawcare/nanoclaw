@@ -1,0 +1,18 @@
+skill: telegram-html
+version: 1.0.0
+description: "Convert markdown to Telegram-compatible HTML before sending messages"
+core_version: 0.1.0
+adds:
+  - src/telegram-html.ts
+  - src/telegram-html.test.ts
+modifies:
+  - src/channels/telegram.ts
+  - src/channels/telegram.test.ts
+structured:
+  npm_dependencies:
+    marked: "^17.0.3"
+  env_additions: []
+conflicts: []
+depends:
+  - telegram
+test: "npx vitest run src/telegram-html.test.ts src/channels/telegram.test.ts"
