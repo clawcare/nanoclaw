@@ -1,0 +1,17 @@
+skill: telegram-reactions
+version: 1.0.0
+description: "React to messages with emoji to acknowledge receipt and signal errors"
+core_version: 0.1.0
+adds: []
+modifies:
+  - src/types.ts
+  - src/channels/telegram.ts
+  - src/channels/telegram.test.ts
+  - src/index.ts
+structured:
+  npm_dependencies: {}
+  env_additions: []
+conflicts: []
+depends:
+  - telegram
+test: "npx vitest run src/channels/telegram.test.ts"
