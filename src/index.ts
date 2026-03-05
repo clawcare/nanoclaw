@@ -15,8 +15,10 @@ import {
 import {
   ContainerOutput,
   runContainerAgent,
+  TopicSnapshot,
   writeGroupsSnapshot,
   writeTasksSnapshot,
+  writeTopicsSnapshot,
 } from './container-runner.js';
 import {
   cleanupOrphans,
@@ -29,7 +31,9 @@ import {
   getAllTasks,
   getMessagesSince,
   getNewMessages,
+  getRecentMessagesForTopic,
   getRouterState,
+  getTopicsWithActivity,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
@@ -62,6 +66,23 @@ let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+/**
+ * Build a cursor key for per-topic message tracking.
+ * undefined/null → plain chatJid (General thread or non-topic channels)
+ * "123"         → "chatJid:t:123" (specific topic)
+ */
+function cursorKey(chatJid: string, topicId?: string | null): string {
+  if (topicId) return `${chatJid}:t:${topicId}`;
+  return chatJid;
+}
+
+/**
+ * Tracks the active topic for each group between startMessageLoop (which
+ * detects the trigger) and processGroupMessages (which builds the prompt).
+ * Value: string = specific topic, null = General thread, undefined = no topic info.
+ */
+const pendingTopics = new Map<string, string | null | undefined>();
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -150,11 +171,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  // Read and clear the active topic set by startMessageLoop
+  const activeTopic = pendingTopics.get(chatJid);
+  pendingTopics.delete(chatJid);
+
+  const cKey = cursorKey(chatJid, activeTopic);
+  const sinceTimestamp = lastAgentTimestamp[cKey] || '';
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
     ASSISTANT_NAME,
+    activeTopic,
   );
 
   if (missedMessages.length === 0) return true;
@@ -174,8 +201,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
-  const previousCursor = lastAgentTimestamp[chatJid] || '';
-  lastAgentTimestamp[chatJid] =
+  const previousCursor = lastAgentTimestamp[cKey] || '';
+  lastAgentTimestamp[cKey] =
     missedMessages[missedMessages.length - 1].timestamp;
   saveState();
 
@@ -243,7 +270,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
     // Roll back cursor so retries can re-process these messages
-    lastAgentTimestamp[chatJid] = previousCursor;
+    lastAgentTimestamp[cKey] = previousCursor;
     saveState();
     logger.warn(
       { group: group.name },
@@ -288,6 +315,36 @@ async function runAgent(
     availableGroups,
     new Set(Object.keys(registeredGroups)),
   );
+
+  // Write topics snapshot for Telegram chats so the agent can browse other topics
+  if (chatJid.startsWith('tg:')) {
+    const lookback = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+    const topicActivities = getTopicsWithActivity(
+      chatJid,
+      lookback,
+      ASSISTANT_NAME,
+    );
+    const topicSnapshots: TopicSnapshot[] = topicActivities.map((ta) => {
+      const msgs = getRecentMessagesForTopic(
+        chatJid,
+        lookback,
+        ASSISTANT_NAME,
+        ta.topic_id,
+        50,
+      );
+      return {
+        topic_id: ta.topic_id,
+        topic_label: ta.topic_id === null ? 'General' : `Topic ${ta.topic_id}`,
+        message_count: ta.message_count,
+        messages: msgs.map((m) => ({
+          sender_name: m.sender_name,
+          content: m.content,
+          timestamp: m.timestamp,
+        })),
+      };
+    });
+    writeTopicsSnapshot(group.folder, chatJid, topicSnapshots);
+  }
 
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
@@ -388,6 +445,7 @@ async function startMessageLoop(): Promise<void> {
           // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
+          let triggerMessage: NewMessage | undefined;
           if (needsTrigger) {
             const allowlistCfg = loadSenderAllowlist();
             const hasTrigger = groupMessages.some(
@@ -396,15 +454,28 @@ async function startMessageLoop(): Promise<void> {
                 (m.is_from_me ||
                   isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
             );
+
             if (!hasTrigger) continue;
+
+            triggerMessage = groupMessages.find(
+              (m) =>
+                TRIGGER_PATTERN.test(m.content.trim()) &&
+                (m.is_from_me ||
+                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
+            );
           }
+
+          // Extract active topic from the trigger message (or first message for main groups)
+          const activeTopic = (triggerMessage ?? groupMessages[0])?.topic_id;
+          const cKey = cursorKey(chatJid, activeTopic);
 
           // Pull all messages since lastAgentTimestamp so non-trigger
           // context that accumulated between triggers is included.
           const allPending = getMessagesSince(
             chatJid,
-            lastAgentTimestamp[chatJid] || '',
+            lastAgentTimestamp[cKey] || '',
             ASSISTANT_NAME,
+            activeTopic,
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
@@ -412,10 +483,10 @@ async function startMessageLoop(): Promise<void> {
 
           if (queue.sendMessage(chatJid, formatted)) {
             logger.debug(
-              { chatJid, count: messagesToSend.length },
+              { chatJid, count: messagesToSend.length, topic: activeTopic },
               'Piped messages to active container',
             );
-            lastAgentTimestamp[chatJid] =
+            lastAgentTimestamp[cKey] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
             // Show typing indicator while the container processes the piped message
@@ -426,6 +497,7 @@ async function startMessageLoop(): Promise<void> {
               );
           } else {
             // No active container — enqueue for a new one
+            pendingTopics.set(chatJid, activeTopic);
             queue.enqueueMessageCheck(chatJid);
           }
         }
@@ -563,6 +635,12 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    createTopic: (() => {
+      const tg = channels.find((ch) => ch.name === 'telegram') as any;
+      return tg?.createForumTopic
+        ? async (jid: string, name: string) => tg.createForumTopic(jid, name)
+        : undefined;
+    })(),
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();

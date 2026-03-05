@@ -525,9 +525,13 @@ async function main(): Promise<void> {
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
-  let prompt = containerInput.prompt;
+  const now = new Date();
+  const tz = process.env.TZ || 'UTC';
+  const dateHeader = `[Current date and time: ${now.toLocaleString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true, timeZone: tz, timeZoneName: 'short' })}]`;
+
+  let prompt = `${dateHeader}\n\n${containerInput.prompt}`;
   if (containerInput.isScheduledTask) {
-    prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
+    prompt = `${dateHeader}\n\n[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${containerInput.prompt}`;
   }
   const pending = drainIpcInput();
   if (pending.length > 0) {

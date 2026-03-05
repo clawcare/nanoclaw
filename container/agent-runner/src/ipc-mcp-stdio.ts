@@ -45,11 +45,18 @@ server.tool(
   {
     text: z.string().describe('The message text to send'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
+    topic_id: z.string().optional().describe('Telegram topic/thread ID to send to. Use this to target a specific topic. If omitted, the message goes to the last active topic.'),
   },
   async (args) => {
+    // When topic_id is provided, encode it in the JID for routing
+    let targetJid = chatJid;
+    if (args.topic_id && chatJid.startsWith('tg:')) {
+      targetJid = `${chatJid}:t:${args.topic_id}`;
+    }
+
     const data: Record<string, string | undefined> = {
       type: 'message',
-      chatJid,
+      chatJid: targetJid,
       text: args.text,
       sender: args.sender || undefined,
       groupFolder,
@@ -277,6 +284,108 @@ Use available_groups.json to find the JID for a group. The folder name must be c
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
     };
+  },
+);
+
+server.tool(
+  'create_topic',
+  'Create a new topic (forum thread) in the current Telegram chat. Only works with Telegram chats that have Topics enabled. The topic will be created and a confirmation message sent to it.',
+  {
+    name: z.string().describe('Name for the new topic'),
+  },
+  async (args) => {
+    if (!chatJid.startsWith('tg:')) {
+      return {
+        content: [{ type: 'text' as const, text: 'Topics are only supported in Telegram chats.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'create_topic',
+      chatJid,
+      name: args.name,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Topic creation requested: "${args.name}". A confirmation will be sent to the new topic.` }],
+    };
+  },
+);
+
+server.tool(
+  'read_topic_messages',
+  'Read messages from a specific Telegram topic/thread. Use this to check what\'s happening in other topics without having them in your main context. Call without topic_id to list all available topics.',
+  {
+    topic_id: z.string().optional().describe('The topic ID to read messages from. Omit to list all available topics with message counts.'),
+  },
+  async (args) => {
+    const snapshotFile = path.join(IPC_DIR, 'topics_snapshot.json');
+
+    try {
+      if (!fs.existsSync(snapshotFile)) {
+        return {
+          content: [{ type: 'text' as const, text: 'No topics snapshot available. This chat may not use Telegram topics.' }],
+        };
+      }
+
+      const snapshot = JSON.parse(fs.readFileSync(snapshotFile, 'utf-8')) as {
+        chatJid: string;
+        generatedAt: string;
+        topics: Array<{
+          topic_id: string | null;
+          topic_label: string;
+          message_count: number;
+          messages: Array<{ sender_name: string; content: string; timestamp: string }>;
+        }>;
+      };
+
+      // List mode: no topic_id specified
+      if (!args.topic_id) {
+        if (snapshot.topics.length === 0) {
+          return { content: [{ type: 'text' as const, text: 'No topics with recent activity.' }] };
+        }
+        const listing = snapshot.topics
+          .map((t) => `- ${t.topic_label} (ID: ${t.topic_id ?? 'null'}) — ${t.message_count} messages`)
+          .join('\n');
+        return {
+          content: [{ type: 'text' as const, text: `Available topics (last 48h):\n${listing}\n\nCall again with topic_id to read messages from a specific topic.` }],
+        };
+      }
+
+      // Find the requested topic
+      const topic = snapshot.topics.find((t) =>
+        args.topic_id === 'null' ? t.topic_id === null : t.topic_id === args.topic_id,
+      );
+
+      if (!topic) {
+        const available = snapshot.topics.map((t) => t.topic_id ?? 'null').join(', ');
+        return {
+          content: [{ type: 'text' as const, text: `Topic "${args.topic_id}" not found. Available topics: ${available}` }],
+          isError: true,
+        };
+      }
+
+      if (topic.messages.length === 0) {
+        return { content: [{ type: 'text' as const, text: `${topic.topic_label}: no recent messages.` }] };
+      }
+
+      const formatted = topic.messages
+        .map((m) => `[${m.timestamp}] ${m.sender_name}: ${m.content}`)
+        .join('\n');
+
+      return {
+        content: [{ type: 'text' as const, text: `${topic.topic_label} (${topic.message_count} messages):\n\n${formatted}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading topics: ${err instanceof Error ? err.message : String(err)}` }],
+      };
+    }
   },
 );
 

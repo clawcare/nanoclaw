@@ -51,6 +51,7 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  topic_id?: string; // Telegram forum thread ID (optional)
 }
 
 export interface ScheduledTask {

@@ -24,10 +24,24 @@ export class TelegramChannel implements Channel {
   private botConnected = false; // Bug #1 fix: track actual connection state
   private opts: TelegramChannelOpts;
   private botToken: string;
+  private lastTopicPerChat = new Map<string, number>();
 
   constructor(botToken: string, opts: TelegramChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
+  }
+
+  /**
+   * Parse a JID into chat ID and optional thread/topic ID.
+   * Supports plain JIDs (tg:123) and topic-qualified JIDs (tg:123:t:456).
+   */
+  private parseJid(jid: string): { chatId: string; threadId?: number } {
+    const stripped = jid.replace(/^tg:/, '');
+    const match = stripped.match(/^(.+):t:(\d+)$/);
+    if (match) {
+      return { chatId: match[1], threadId: parseInt(match[2], 10) };
+    }
+    return { chatId: stripped };
   }
 
   async connect(): Promise<void> {
@@ -67,6 +81,12 @@ export class TelegramChannel implements Channel {
         'Unknown';
       const sender = ctx.from?.id.toString() || '';
       const msgId = ctx.message.message_id.toString();
+
+      // Capture Telegram topic/thread ID
+      const threadId = ctx.message.message_thread_id;
+      if (threadId) {
+        this.lastTopicPerChat.set(chatJid, threadId);
+      }
 
       // Determine chat name
       const chatName =
@@ -124,10 +144,11 @@ export class TelegramChannel implements Channel {
         content,
         timestamp,
         is_from_me: false,
+        topic_id: threadId?.toString(),
       });
 
       logger.info(
-        { chatJid, chatName, sender: senderName },
+        { chatJid, chatName, sender: senderName, threadId },
         'Telegram message stored',
       );
     });
@@ -145,6 +166,12 @@ export class TelegramChannel implements Channel {
         ctx.from?.id?.toString() ||
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+
+      // Capture Telegram topic/thread ID
+      const threadId = ctx.message.message_thread_id;
+      if (threadId) {
+        this.lastTopicPerChat.set(chatJid, threadId);
+      }
 
       // Bug #4 fix: Calculate chatName for non-text messages (same logic as text messages)
       const chatName =
@@ -169,6 +196,7 @@ export class TelegramChannel implements Channel {
         content: `${placeholder}${caption}`,
         timestamp,
         is_from_me: false,
+        topic_id: threadId?.toString(),
       });
     };
 
@@ -227,21 +255,31 @@ export class TelegramChannel implements Channel {
     }
 
     try {
-      const numericId = jid.replace(/^tg:/, '');
+      const { chatId, threadId } = this.parseJid(jid);
+      // Use explicit thread ID from JID, or fall back to last known topic for this chat
+      const baseJid = `tg:${chatId}`;
+      const effectiveThreadId = threadId ?? this.lastTopicPerChat.get(baseJid);
+      const opts = effectiveThreadId
+        ? { message_thread_id: effectiveThreadId }
+        : {};
 
       // Telegram has a 4096 character limit per message — split if needed
       const MAX_LENGTH = 4096;
       if (text.length <= MAX_LENGTH) {
-        await this.bot.api.sendMessage(numericId, text);
+        await this.bot.api.sendMessage(chatId, text, opts);
       } else {
         for (let i = 0; i < text.length; i += MAX_LENGTH) {
           await this.bot.api.sendMessage(
-            numericId,
+            chatId,
             text.slice(i, i + MAX_LENGTH),
+            opts,
           );
         }
       }
-      logger.info({ jid, length: text.length }, 'Telegram message sent');
+      logger.info(
+        { jid, threadId: effectiveThreadId, length: text.length },
+        'Telegram message sent',
+      );
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Telegram message');
     }
@@ -264,11 +302,26 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  /**
+   * Create a new forum topic in a Telegram chat.
+   * Returns the message_thread_id of the created topic.
+   */
+  async createForumTopic(jid: string, name: string): Promise<number> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const { chatId } = this.parseJid(jid);
+    const result = await this.bot.api.createForumTopic(chatId, name);
+    return result.message_thread_id;
+  }
+
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     if (!this.bot || !isTyping) return;
     try {
-      const numericId = jid.replace(/^tg:/, '');
-      await this.bot.api.sendChatAction(numericId, 'typing');
+      const { chatId, threadId } = this.parseJid(jid);
+      const baseJid = `tg:${chatId}`;
+      const effectiveThreadId = threadId ?? this.lastTopicPerChat.get(baseJid);
+      await this.bot.api.sendChatAction(chatId, 'typing', {
+        message_thread_id: effectiveThreadId,
+      });
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }

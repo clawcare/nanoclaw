@@ -22,9 +22,18 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  createTopic?: (jid: string, name: string) => Promise<number>;
 }
 
 let ipcWatcherRunning = false;
+
+/**
+ * Extract the base JID from a potentially topic-qualified JID.
+ * e.g., "tg:123:t:456" → "tg:123", "tg:123" → "tg:123"
+ */
+function getBaseJid(jid: string): string {
+  return jid.replace(/:t:\d+$/, '');
+}
 
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
@@ -75,7 +84,9 @@ export function startIpcWatcher(deps: IpcDeps): void {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
+                // Use base JID for group lookup (strip topic qualifier if present)
+                const baseJid = getBaseJid(data.chatJid);
+                const targetGroup = registeredGroups[baseJid];
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
@@ -379,6 +390,40 @@ export async function processTaskIpc(
         logger.warn(
           { data },
           'Invalid register_group request - missing required fields',
+        );
+      }
+      break;
+
+    case 'create_topic':
+      // Create a Telegram forum topic
+      if (!deps.createTopic) {
+        logger.warn('create_topic not supported (no Telegram channel)');
+        break;
+      }
+      if (!data.chatJid || !data.name) {
+        logger.warn({ data }, 'Invalid create_topic request - missing fields');
+        break;
+      }
+      if (!data.chatJid.startsWith('tg:')) {
+        logger.warn(
+          { chatJid: data.chatJid },
+          'create_topic only supported for Telegram chats',
+        );
+        break;
+      }
+      try {
+        const topicId = await deps.createTopic(data.chatJid, data.name);
+        // Send confirmation to the newly created topic
+        const topicJid = `${data.chatJid}:t:${topicId}`;
+        await deps.sendMessage(topicJid, `Topic "${data.name}" created.`);
+        logger.info(
+          { chatJid: data.chatJid, topicId, name: data.name },
+          'Topic created via IPC',
+        );
+      } catch (err) {
+        logger.error(
+          { chatJid: data.chatJid, name: data.name, err },
+          'Failed to create topic via IPC',
         );
       }
       break;

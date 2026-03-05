@@ -188,7 +188,7 @@ function buildVolumeMounts(
     group.folder,
     'agent-runner-src',
   );
-  if (!fs.existsSync(groupAgentRunnerDir) && fs.existsSync(agentRunnerSrc)) {
+  if (fs.existsSync(agentRunnerSrc)) {
     fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
   }
   mounts.push({
@@ -661,6 +661,46 @@ export function writeTasksSnapshot(
 
   const tasksFile = path.join(groupIpcDir, 'current_tasks.json');
   fs.writeFileSync(tasksFile, JSON.stringify(filteredTasks, null, 2));
+}
+
+export interface TopicSnapshot {
+  topic_id: string | null;
+  topic_label: string;
+  message_count: number;
+  messages: Array<{
+    sender_name: string;
+    content: string;
+    timestamp: string;
+  }>;
+}
+
+/**
+ * Write topics snapshot for Telegram chats so the agent can browse other topics.
+ * Only meaningful for Telegram chats (chatJid starts with 'tg:').
+ */
+export function writeTopicsSnapshot(
+  groupFolder: string,
+  chatJid: string,
+  topics: TopicSnapshot[],
+): void {
+  if (!chatJid.startsWith('tg:')) return;
+
+  const groupIpcDir = resolveGroupIpcPath(groupFolder);
+  fs.mkdirSync(groupIpcDir, { recursive: true });
+
+  const snapshotFile = path.join(groupIpcDir, 'topics_snapshot.json');
+  fs.writeFileSync(
+    snapshotFile,
+    JSON.stringify(
+      {
+        chatJid,
+        generatedAt: new Date().toISOString(),
+        topics,
+      },
+      null,
+      2,
+    ),
+  );
 }
 
 export interface AvailableGroup {

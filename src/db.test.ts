@@ -8,7 +8,9 @@ import {
   getAllRegisteredGroups,
   getMessagesSince,
   getNewMessages,
+  getRecentMessagesForTopic,
   getTaskById,
+  getTopicsWithActivity,
   setRegisteredGroup,
   storeChatMetadata,
   storeMessage,
@@ -422,5 +424,168 @@ describe('registered group isMain', () => {
     const group = groups['group@g.us'];
     expect(group).toBeDefined();
     expect(group.isMain).toBeUndefined();
+  });
+});
+
+// --- getMessagesSince topic filtering ---
+
+describe('getMessagesSince topic filtering', () => {
+  beforeEach(() => {
+    storeChatMetadata('tg:-100123', '2024-01-01T00:00:00.000Z');
+
+    // General thread message (no topic)
+    storeMessage({
+      id: 't1',
+      chat_jid: 'tg:-100123',
+      sender: '1',
+      sender_name: 'Alice',
+      content: 'general msg',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    // Topic 42 message
+    storeMessage({
+      id: 't2',
+      chat_jid: 'tg:-100123',
+      sender: '2',
+      sender_name: 'Bob',
+      content: 'topic 42 msg',
+      timestamp: '2024-01-01T00:00:02.000Z',
+      topic_id: '42',
+    });
+    // Topic 99 message
+    storeMessage({
+      id: 't3',
+      chat_jid: 'tg:-100123',
+      sender: '3',
+      sender_name: 'Carol',
+      content: 'topic 99 msg',
+      timestamp: '2024-01-01T00:00:03.000Z',
+      topic_id: '99',
+    });
+    // Another topic 42 message
+    storeMessage({
+      id: 't4',
+      chat_jid: 'tg:-100123',
+      sender: '1',
+      sender_name: 'Alice',
+      content: 'topic 42 second',
+      timestamp: '2024-01-01T00:00:04.000Z',
+      topic_id: '42',
+    });
+  });
+
+  it('returns all messages when topicId is undefined', () => {
+    const msgs = getMessagesSince('tg:-100123', '', 'Andy');
+    expect(msgs).toHaveLength(4);
+  });
+
+  it('returns only General thread messages when topicId is null', () => {
+    const msgs = getMessagesSince('tg:-100123', '', 'Andy', null);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].content).toBe('general msg');
+  });
+
+  it('returns only specific topic messages when topicId is a string', () => {
+    const msgs = getMessagesSince('tg:-100123', '', 'Andy', '42');
+    expect(msgs).toHaveLength(2);
+    expect(msgs[0].content).toBe('topic 42 msg');
+    expect(msgs[1].content).toBe('topic 42 second');
+  });
+
+  it('returns empty for non-existent topic', () => {
+    const msgs = getMessagesSince('tg:-100123', '', 'Andy', '999');
+    expect(msgs).toHaveLength(0);
+  });
+});
+
+// --- getTopicsWithActivity ---
+
+describe('getTopicsWithActivity', () => {
+  beforeEach(() => {
+    storeChatMetadata('tg:-100123', '2024-01-01T00:00:00.000Z');
+
+    storeMessage({
+      id: 'a1',
+      chat_jid: 'tg:-100123',
+      sender: '1',
+      sender_name: 'Alice',
+      content: 'general',
+      timestamp: '2024-01-01T00:00:01.000Z',
+    });
+    storeMessage({
+      id: 'a2',
+      chat_jid: 'tg:-100123',
+      sender: '2',
+      sender_name: 'Bob',
+      content: 'topic 5 first',
+      timestamp: '2024-01-01T00:00:02.000Z',
+      topic_id: '5',
+    });
+    storeMessage({
+      id: 'a3',
+      chat_jid: 'tg:-100123',
+      sender: '2',
+      sender_name: 'Bob',
+      content: 'topic 5 second',
+      timestamp: '2024-01-01T00:00:03.000Z',
+      topic_id: '5',
+    });
+  });
+
+  it('returns distinct topics with message counts', () => {
+    const topics = getTopicsWithActivity('tg:-100123', '', 'Andy');
+    expect(topics).toHaveLength(2);
+    const topic5 = topics.find((t) => t.topic_id === '5');
+    const general = topics.find((t) => t.topic_id === null);
+    expect(topic5?.message_count).toBe(2);
+    expect(general?.message_count).toBe(1);
+  });
+});
+
+// --- getRecentMessagesForTopic ---
+
+describe('getRecentMessagesForTopic', () => {
+  beforeEach(() => {
+    storeChatMetadata('tg:-100123', '2024-01-01T00:00:00.000Z');
+
+    for (let i = 1; i <= 5; i++) {
+      storeMessage({
+        id: `r${i}`,
+        chat_jid: 'tg:-100123',
+        sender: '1',
+        sender_name: 'Alice',
+        content: `msg ${i}`,
+        timestamp: `2024-01-01T00:00:0${i}.000Z`,
+        topic_id: '10',
+      });
+    }
+  });
+
+  it('returns messages in chronological order limited by count', () => {
+    const msgs = getRecentMessagesForTopic('tg:-100123', '', 'Andy', '10', 3);
+    expect(msgs).toHaveLength(3);
+    // Should be the 3 most recent in chronological order
+    expect(msgs[0].content).toBe('msg 3');
+    expect(msgs[1].content).toBe('msg 4');
+    expect(msgs[2].content).toBe('msg 5');
+  });
+
+  it('returns all messages when limit exceeds count', () => {
+    const msgs = getRecentMessagesForTopic('tg:-100123', '', 'Andy', '10', 50);
+    expect(msgs).toHaveLength(5);
+  });
+
+  it('returns General thread messages when topicId is null', () => {
+    storeMessage({
+      id: 'gen1',
+      chat_jid: 'tg:-100123',
+      sender: '1',
+      sender_name: 'Alice',
+      content: 'general msg',
+      timestamp: '2024-01-01T00:00:06.000Z',
+    });
+    const msgs = getRecentMessagesForTopic('tg:-100123', '', 'Andy', null, 10);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0].content).toBe('general msg');
   });
 });
