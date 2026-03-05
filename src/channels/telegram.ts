@@ -12,7 +12,10 @@ import {
 } from '../types.js';
 
 /** Parse a JID into chat ID and optional thread/topic ID. */
-export function parseTelegramJid(jid: string): { chatId: string; threadId?: number } {
+export function parseTelegramJid(jid: string): {
+  chatId: string;
+  threadId?: number;
+} {
   const stripped = jid.replace(/^tg:/, '');
   const match = stripped.match(/^(.+):t:(\d+)$/);
   if (match) {
@@ -62,9 +65,15 @@ export async function sendPoolMessage(
     try {
       await poolApis[idx].setMyName(sender);
       await new Promise((r) => setTimeout(r, 2000));
-      logger.info({ sender, groupFolder, poolIndex: idx }, 'Assigned and renamed pool bot');
+      logger.info(
+        { sender, groupFolder, poolIndex: idx },
+        'Assigned and renamed pool bot',
+      );
     } catch (err) {
-      logger.warn({ sender, err }, 'Failed to rename pool bot (sending anyway)');
+      logger.warn(
+        { sender, err },
+        'Failed to rename pool bot (sending anyway)',
+      );
     }
   }
 
@@ -80,7 +89,10 @@ export async function sendPoolMessage(
         await api.sendMessage(chatId, text.slice(i, i + MAX_LENGTH), opts);
       }
     }
-    logger.info({ jid, sender, poolIndex: idx, threadId, length: text.length }, 'Pool message sent');
+    logger.info(
+      { jid, sender, poolIndex: idx, threadId, length: text.length },
+      'Pool message sent',
+    );
   } catch (err) {
     logger.error({ jid, sender, err }, 'Failed to send pool message');
   }
@@ -280,9 +292,7 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
       const rawName = ctx.message.document?.file_name || 'file';
-      const sanitizedName = rawName
-        .replace(/[<>&"]/g, '')
-        .slice(0, 64);
+      const sanitizedName = rawName.replace(/[<>&"]/g, '').slice(0, 64);
       storeNonText(ctx, `[Document: ${sanitizedName}]`);
     });
     this.bot.on('message:sticker', (ctx) => {
