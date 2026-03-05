@@ -1,19 +1,15 @@
-import fs from 'fs';
-import path from 'path';
-
 import { Bot } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
-import { resolveGroupFolderPath } from '../group-folder.js';
+import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
-
-const MAX_DOWNLOAD_SIZE = 20 * 1024 * 1024; // 20 MB (Telegram Bot API limit)
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -25,6 +21,7 @@ export class TelegramChannel implements Channel {
   name = 'telegram';
 
   private bot: Bot | null = null;
+  private botConnected = false;
   private opts: TelegramChannelOpts;
   private botToken: string;
   private lastTopicPerChat = new Map<string, number>();
@@ -45,66 +42,6 @@ export class TelegramChannel implements Channel {
       return { chatId: match[1], threadId: parseInt(match[2], 10) };
     }
     return { chatId: stripped };
-  }
-
-  /**
-   * Download a file from Telegram and save it to the group's downloads folder.
-   * Returns the container-visible path on success, or null on failure.
-   */
-  private async downloadTelegramFile(
-    ctx: any,
-    groupFolder: string,
-    fileName: string,
-  ): Promise<string | null> {
-    try {
-      const fileObj = await ctx.getFile();
-      if (!fileObj.file_path) return null;
-
-      // Check size before downloading
-      if (fileObj.file_size && fileObj.file_size > MAX_DOWNLOAD_SIZE) {
-        logger.warn(
-          { fileName, size: fileObj.file_size },
-          'File too large to download',
-        );
-        return null;
-      }
-
-      const groupDir = resolveGroupFolderPath(groupFolder);
-      const downloadsDir = path.join(groupDir, 'downloads');
-      fs.mkdirSync(downloadsDir, { recursive: true });
-
-      // Sanitize filename: strip path separators, collapse dots
-      const sanitized = fileName
-        .replace(/[/\\]/g, '_')
-        .replace(/\.{2,}/g, '.')
-        .slice(0, 200);
-      const diskName = `${Date.now()}-${sanitized}`;
-      const hostPath = path.join(downloadsDir, diskName);
-
-      const downloadUrl = `https://api.telegram.org/file/bot${this.botToken}/${fileObj.file_path}`;
-      const res = await fetch(downloadUrl);
-      if (!res.ok) {
-        logger.warn(
-          { status: res.status, fileName },
-          'Telegram file download failed',
-        );
-        return null;
-      }
-
-      const buffer = Buffer.from(await res.arrayBuffer());
-      fs.writeFileSync(hostPath, buffer);
-
-      logger.info(
-        { fileName, size: buffer.length, hostPath },
-        'Telegram file downloaded',
-      );
-
-      // Return the path as the agent sees it inside the container
-      return `/workspace/group/downloads/${diskName}`;
-    } catch (err) {
-      logger.error({ err, fileName }, 'Failed to download Telegram file');
-      return null;
-    }
   }
 
   async connect(): Promise<void> {
@@ -236,12 +173,17 @@ export class TelegramChannel implements Channel {
         this.lastTopicPerChat.set(chatJid, threadId);
       }
 
+      const chatName =
+        ctx.chat.type === 'private'
+          ? senderName
+          : (ctx.chat as any).title || chatJid;
+
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
       this.opts.onChatMetadata(
         chatJid,
         timestamp,
-        undefined,
+        chatName,
         'telegram',
         isGroup,
       );
@@ -257,62 +199,17 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:document', async (ctx) => {
-      const chatJid = `tg:${ctx.chat.id}`;
-      const group = this.opts.registeredGroups()[chatJid];
-      if (!group) return;
-
-      const name = ctx.message.document?.file_name || 'file';
-      const containerPath = await this.downloadTelegramFile(
-        ctx,
-        group.folder,
-        name,
-      );
-
-      if (containerPath) {
-        storeNonText(
-          ctx,
-          `[Document: ${name}]\nFile saved to: ${containerPath}`,
-        );
-      } else {
-        storeNonText(ctx, `[Document: ${name}]`);
-      }
-    });
-
-    this.bot.on('message:photo', async (ctx) => {
-      const chatJid = `tg:${ctx.chat.id}`;
-      const group = this.opts.registeredGroups()[chatJid];
-      if (!group) return;
-
-      // Pick highest-resolution photo (last in array)
-      const photos = ctx.message.photo;
-      const best = photos?.[photos.length - 1];
-      if (!best) {
-        storeNonText(ctx, '[Photo]');
-        return;
-      }
-
-      // Build a context-like object with getFile for the specific photo
-      const photoCtx = {
-        getFile: () => this.bot!.api.getFile(best.file_id),
-      };
-      const ext = 'jpg';
-      const containerPath = await this.downloadTelegramFile(
-        photoCtx,
-        group.folder,
-        `photo.${ext}`,
-      );
-
-      if (containerPath) {
-        storeNonText(ctx, `[Photo]\nFile saved to: ${containerPath}`);
-      } else {
-        storeNonText(ctx, '[Photo]');
-      }
-    });
-
+    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
+    this.bot.on('message:document', (ctx) => {
+      const rawName = ctx.message.document?.file_name || 'file';
+      const sanitizedName = rawName
+        .replace(/[<>&"]/g, '')
+        .slice(0, 64);
+      storeNonText(ctx, `[Document: ${sanitizedName}]`);
+    });
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
       storeNonText(ctx, `[Sticker ${emoji}]`);
@@ -325,10 +222,10 @@ export class TelegramChannel implements Channel {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
-    // Start polling — returns a Promise that resolves when started
-    return new Promise<void>((resolve) => {
+    return new Promise<void>((resolve, reject) => {
       this.bot!.start({
         onStart: (botInfo) => {
+          this.botConnected = true;
           logger.info(
             { username: botInfo.username, id: botInfo.id },
             'Telegram bot connected',
@@ -339,6 +236,10 @@ export class TelegramChannel implements Channel {
           );
           resolve();
         },
+      }).catch((err) => {
+        this.botConnected = false;
+        logger.error({ err }, 'Telegram bot failed to start');
+        reject(err);
       });
     });
   }
@@ -380,19 +281,8 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  /**
-   * Create a new forum topic in a Telegram chat.
-   * Returns the message_thread_id of the created topic.
-   */
-  async createForumTopic(jid: string, name: string): Promise<number> {
-    if (!this.bot) throw new Error('Telegram bot not initialized');
-    const { chatId } = this.parseJid(jid);
-    const result = await this.bot.api.createForumTopic(chatId, name);
-    return result.message_thread_id;
-  }
-
   isConnected(): boolean {
-    return this.bot !== null;
+    return this.botConnected;
   }
 
   ownsJid(jid: string): boolean {
@@ -403,8 +293,20 @@ export class TelegramChannel implements Channel {
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
+      this.botConnected = false;
       logger.info('Telegram bot stopped');
     }
+  }
+
+  /**
+   * Create a new forum topic in a Telegram chat.
+   * Returns the message_thread_id of the created topic.
+   */
+  async createForumTopic(jid: string, name: string): Promise<number> {
+    if (!this.bot) throw new Error('Telegram bot not initialized');
+    const { chatId } = this.parseJid(jid);
+    const result = await this.bot.api.createForumTopic(chatId, name);
+    return result.message_thread_id;
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
@@ -421,3 +323,14 @@ export class TelegramChannel implements Channel {
     }
   }
 }
+
+registerChannel('telegram', (opts: ChannelOpts) => {
+  const envVars = readEnvFile(['TELEGRAM_BOT_TOKEN']);
+  const token =
+    process.env.TELEGRAM_BOT_TOKEN || envVars.TELEGRAM_BOT_TOKEN || '';
+  if (!token) {
+    logger.warn('Telegram: TELEGRAM_BOT_TOKEN not set');
+    return null;
+  }
+  return new TelegramChannel(token, opts);
+});

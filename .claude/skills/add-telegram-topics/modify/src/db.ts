@@ -106,6 +106,26 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add is_main column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN is_main INTEGER DEFAULT 0`,
+    );
+    // Backfill: existing rows with folder = 'main' are the main group
+    database.exec(
+      `UPDATE registered_groups SET is_main = 1 WHERE folder = 'main'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add topic_id column for Telegram Topics support (migration for existing DBs)
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN topic_id TEXT`);
+  } catch {
+    /* column already exists */
+  }
+
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
   try {
     database.exec(`ALTER TABLE chats ADD COLUMN channel TEXT`);
@@ -125,13 +145,6 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* columns already exist */
-  }
-
-  // Add topic_id column for Telegram Topics support (migration for existing DBs)
-  try {
-    database.exec(`ALTER TABLE messages ADD COLUMN topic_id TEXT`);
-  } catch {
-    /* column already exists */
   }
 }
 
@@ -271,7 +284,7 @@ export function storeMessage(msg: NewMessage): void {
 }
 
 /**
- * Store a message directly (for non-WhatsApp channels that don't use Baileys proto).
+ * Store a message directly.
  */
 export function storeMessageDirect(msg: {
   id: string;
@@ -332,20 +345,86 @@ export function getMessagesSince(
   chatJid: string,
   sinceTimestamp: string,
   botPrefix: string,
+  topicId?: string | null,
 ): NewMessage[] {
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
+  //
+  // topicId filtering:
+  //   undefined → no filter (all topics, used by recovery/non-Telegram)
+  //   null      → General thread only (topic_id IS NULL)
+  //   "123"     → specific topic (topic_id = ?)
+  let topicClause = '';
+  const params: unknown[] = [chatJid, sinceTimestamp, `${botPrefix}:%`];
+
+  if (topicId === null) {
+    topicClause = ' AND topic_id IS NULL';
+  } else if (topicId !== undefined) {
+    topicClause = ' AND topic_id = ?';
+    params.push(topicId);
+  }
+
+  const sql = `
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, topic_id
+    FROM messages
+    WHERE chat_jid = ? AND timestamp > ?
+      AND is_bot_message = 0 AND content NOT LIKE ?
+      AND content != '' AND content IS NOT NULL${topicClause}
+    ORDER BY timestamp
+  `;
+  return db.prepare(sql).all(...params) as NewMessage[];
+}
+
+export interface TopicActivity {
+  topic_id: string | null;
+  message_count: number;
+}
+
+export function getTopicsWithActivity(
+  chatJid: string,
+  sinceTimestamp: string,
+  botPrefix: string,
+): TopicActivity[] {
+  const sql = `
+    SELECT topic_id, COUNT(*) as message_count
+    FROM messages
+    WHERE chat_jid = ? AND timestamp > ?
+      AND is_bot_message = 0 AND content NOT LIKE ?
+      AND content != '' AND content IS NOT NULL
+    GROUP BY topic_id
+    ORDER BY MAX(timestamp) DESC
+  `;
+  return db
+    .prepare(sql)
+    .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as TopicActivity[];
+}
+
+export function getRecentMessagesForTopic(
+  chatJid: string,
+  sinceTimestamp: string,
+  botPrefix: string,
+  topicId: string | null,
+  limit: number,
+): NewMessage[] {
+  const topicClause =
+    topicId === null ? 'AND topic_id IS NULL' : 'AND topic_id = ?';
+  const params: unknown[] = [chatJid, sinceTimestamp, `${botPrefix}:%`];
+  if (topicId !== null) params.push(topicId);
+  params.push(limit);
+
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp, topic_id
     FROM messages
     WHERE chat_jid = ? AND timestamp > ?
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND content != '' AND content IS NOT NULL
-    ORDER BY timestamp
+      ${topicClause}
+    ORDER BY timestamp DESC
+    LIMIT ?
   `;
-  return db
-    .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`) as NewMessage[];
+  // Query returns newest-first; reverse to chronological order
+  const rows = db.prepare(sql).all(...params) as NewMessage[];
+  return rows.reverse();
 }
 
 export function createTask(
@@ -538,6 +617,7 @@ export function getRegisteredGroup(
         added_at: string;
         container_config: string | null;
         requires_trigger: number | null;
+        is_main: number | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -559,6 +639,7 @@ export function getRegisteredGroup(
       : undefined,
     requiresTrigger:
       row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+    isMain: row.is_main === 1 ? true : undefined,
   };
 }
 
@@ -567,8 +648,8 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     throw new Error(`Invalid group folder "${group.folder}" for JID ${jid}`);
   }
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, is_main)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -577,6 +658,7 @@ export function setRegisteredGroup(jid: string, group: RegisteredGroup): void {
     group.added_at,
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+    group.isMain ? 1 : 0,
   );
 }
 
@@ -589,6 +671,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     added_at: string;
     container_config: string | null;
     requires_trigger: number | null;
+    is_main: number | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -609,6 +692,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
         : undefined,
       requiresTrigger:
         row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+      isMain: row.is_main === 1 ? true : undefined,
     };
   }
   return result;

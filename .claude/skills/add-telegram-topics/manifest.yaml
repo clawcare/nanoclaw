@@ -1,6 +1,6 @@
 skill: telegram-topics
-version: 1.0.0
-description: "Telegram Topics/Threads support — reply in correct topic, create topics"
+version: 2.0.0
+description: "Telegram Topics/Threads support — reply in correct topic, per-topic message isolation, create topics, browse topic messages"
 core_version: 0.1.0
 adds: []
 modifies:
@@ -10,9 +10,10 @@ modifies:
   - src/router.ts
   - src/ipc.ts
   - src/index.ts
+  - src/container-runner.ts
   - container/agent-runner/src/ipc-mcp-stdio.ts
 structured: {}
 conflicts: []
 depends:
   - telegram
-test: "npx vitest run src/channels/telegram.test.ts"
+test: "npx vitest run src/channels/telegram.test.ts src/db.test.ts"
