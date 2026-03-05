@@ -6,7 +6,11 @@ import { readEnvFile } from './env.js';
 // Read config values from .env (falls back to process.env).
 // Secrets are NOT read here — they stay on disk and are loaded only
 // where needed (container-runner.ts) to avoid leaking to child processes.
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'TELEGRAM_BOT_POOL',
+]);
 
 export const ASSISTANT_NAME =
   process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
@@ -62,6 +66,16 @@ export const TRIGGER_PATTERN = new RegExp(
   `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
   'i',
 );
+
+// Telegram bot pool for agent teams (swarm mode)
+export const TELEGRAM_BOT_POOL = (
+  process.env.TELEGRAM_BOT_POOL ||
+  envConfig.TELEGRAM_BOT_POOL ||
+  ''
+)
+  .split(',')
+  .map((t) => t.trim())
+  .filter(Boolean);
 
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default

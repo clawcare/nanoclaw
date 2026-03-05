@@ -1,4 +1,4 @@
-import { Bot } from 'grammy';
+import { Api, Bot } from 'grammy';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -11,6 +11,81 @@ import {
   RegisteredGroup,
 } from '../types.js';
 
+/** Parse a JID into chat ID and optional thread/topic ID. */
+export function parseTelegramJid(jid: string): { chatId: string; threadId?: number } {
+  const stripped = jid.replace(/^tg:/, '');
+  const match = stripped.match(/^(.+):t:(\d+)$/);
+  if (match) {
+    return { chatId: match[1], threadId: parseInt(match[2], 10) };
+  }
+  return { chatId: stripped };
+}
+
+// Bot pool for agent teams: send-only Api instances (no polling)
+const poolApis: Api[] = [];
+const senderBotMap = new Map<string, number>();
+let nextPoolIndex = 0;
+
+export async function initBotPool(tokens: string[]): Promise<void> {
+  for (const token of tokens) {
+    try {
+      const api = new Api(token);
+      const me = await api.getMe();
+      poolApis.push(api);
+      logger.info(
+        { username: me.username, id: me.id, poolSize: poolApis.length },
+        'Pool bot initialized',
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to initialize pool bot');
+    }
+  }
+  if (poolApis.length > 0) {
+    logger.info({ count: poolApis.length }, 'Telegram bot pool ready');
+  }
+}
+
+export async function sendPoolMessage(
+  jid: string,
+  text: string,
+  sender: string,
+  groupFolder: string,
+): Promise<void> {
+  if (poolApis.length === 0) return;
+
+  const key = `${groupFolder}:${sender}`;
+  let idx = senderBotMap.get(key);
+  if (idx === undefined) {
+    idx = nextPoolIndex % poolApis.length;
+    nextPoolIndex++;
+    senderBotMap.set(key, idx);
+    try {
+      await poolApis[idx].setMyName(sender);
+      await new Promise((r) => setTimeout(r, 2000));
+      logger.info({ sender, groupFolder, poolIndex: idx }, 'Assigned and renamed pool bot');
+    } catch (err) {
+      logger.warn({ sender, err }, 'Failed to rename pool bot (sending anyway)');
+    }
+  }
+
+  const api = poolApis[idx];
+  try {
+    const { chatId, threadId } = parseTelegramJid(jid);
+    const opts = threadId ? { message_thread_id: threadId } : {};
+    const MAX_LENGTH = 4096;
+    if (text.length <= MAX_LENGTH) {
+      await api.sendMessage(chatId, text, opts);
+    } else {
+      for (let i = 0; i < text.length; i += MAX_LENGTH) {
+        await api.sendMessage(chatId, text.slice(i, i + MAX_LENGTH), opts);
+      }
+    }
+    logger.info({ jid, sender, poolIndex: idx, threadId, length: text.length }, 'Pool message sent');
+  } catch (err) {
+    logger.error({ jid, sender, err }, 'Failed to send pool message');
+  }
+}
+
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -21,7 +96,7 @@ export class TelegramChannel implements Channel {
   name = 'telegram';
 
   private bot: Bot | null = null;
-  private botConnected = false; // Bug #1 fix: track actual connection state
+  private botConnected = false;
   private opts: TelegramChannelOpts;
   private botToken: string;
   private lastTopicPerChat = new Map<string, number>();
@@ -173,7 +248,6 @@ export class TelegramChannel implements Channel {
         this.lastTopicPerChat.set(chatJid, threadId);
       }
 
-      // Bug #4 fix: Calculate chatName for non-text messages (same logic as text messages)
       const chatName =
         ctx.chat.type === 'private'
           ? senderName
@@ -205,11 +279,10 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
     this.bot.on('message:document', (ctx) => {
-      // Bug #3 fix: Sanitize filename to prevent XML injection
       const rawName = ctx.message.document?.file_name || 'file';
       const sanitizedName = rawName
-        .replace(/[<>&"]/g, '') // Remove XML special characters
-        .slice(0, 64); // Limit length
+        .replace(/[<>&"]/g, '')
+        .slice(0, 64);
       storeNonText(ctx, `[Document: ${sanitizedName}]`);
     });
     this.bot.on('message:sticker', (ctx) => {
@@ -224,11 +297,10 @@ export class TelegramChannel implements Channel {
       logger.error({ err: err.message }, 'Telegram bot error');
     });
 
-    // Bug #2 fix: Start polling with proper rejection handling
     return new Promise<void>((resolve, reject) => {
       this.bot!.start({
         onStart: (botInfo) => {
-          this.botConnected = true; // Bug #1 fix: set flag when actually connected
+          this.botConnected = true;
           logger.info(
             { username: botInfo.username, id: botInfo.id },
             'Telegram bot connected',
@@ -240,7 +312,6 @@ export class TelegramChannel implements Channel {
           resolve();
         },
       }).catch((err) => {
-        // Bug #2 fix: Prevent hanging on failure
         this.botConnected = false;
         logger.error({ err }, 'Telegram bot failed to start');
         reject(err);
@@ -286,7 +357,7 @@ export class TelegramChannel implements Channel {
   }
 
   isConnected(): boolean {
-    return this.botConnected; // Bug #1 fix: use connection state flag instead of bot !== null
+    return this.botConnected;
   }
 
   ownsJid(jid: string): boolean {
@@ -297,7 +368,7 @@ export class TelegramChannel implements Channel {
     if (this.bot) {
       this.bot.stop();
       this.bot = null;
-      this.botConnected = false; // Bug #1 fix: reset flag on disconnect
+      this.botConnected = false;
       logger.info('Telegram bot stopped');
     }
   }

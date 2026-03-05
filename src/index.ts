@@ -5,6 +5,7 @@ import {
   ASSISTANT_NAME,
   IDLE_TIMEOUT,
   POLL_INTERVAL,
+  TELEGRAM_BOT_POOL,
   TRIGGER_PATTERN,
 } from './config.js';
 import './channels/index.js';
@@ -43,6 +44,7 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
+import { initBotPool } from './channels/telegram.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -448,21 +450,13 @@ async function startMessageLoop(): Promise<void> {
           let triggerMessage: NewMessage | undefined;
           if (needsTrigger) {
             const allowlistCfg = loadSenderAllowlist();
-            const hasTrigger = groupMessages.some(
-              (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
-                (m.is_from_me ||
-                  isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
-            );
-
-            if (!hasTrigger) continue;
-
             triggerMessage = groupMessages.find(
               (m) =>
                 TRIGGER_PATTERN.test(m.content.trim()) &&
                 (m.is_from_me ||
                   isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
             );
+            if (!triggerMessage) continue;
           }
 
           // Extract active topic from the trigger message (or first message for main groups)
@@ -598,6 +592,10 @@ async function main(): Promise<void> {
   if (channels.length === 0) {
     logger.fatal('No channels connected');
     process.exit(1);
+  }
+
+  if (TELEGRAM_BOT_POOL.length > 0) {
+    await initBotPool(TELEGRAM_BOT_POOL);
   }
 
   // Start subsystems (independently of connection handler)
